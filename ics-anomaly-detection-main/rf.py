@@ -1,68 +1,68 @@
-# numpy stack
 import numpy as np
-
-# Ignore ugly futurewarnings
-import warnings
-warnings.filterwarnings('ignore', category=FutureWarning)
-
-# sklearn for Random Forest
 from sklearn.ensemble import RandomForestRegressor
 
-# Random Forest Regressor class
-class RFRegressorDetector(object):
-    """ sklearn-based Random Forest Regressor for ICS anomaly detection.
-
-        Attributes:
-        params: dictionary with parameters defining the model structure,
+class RFRegressorDetector:
     """
-    def __init__(self, **kwargs):
-        """ Constructor: stores parameters and initializes RF model. """
+    Random Forest Regressor for ICS anomaly detection.
+    Predicts the next value of the first sensor channel.
+    """
+
+    def __init__(self, n_estimators=100, max_depth=None, random_state=42):
         print("(+) Initializing Random Forest Regressor...")
-
-        # Default parameter values
-        params = {
-            'n_estimators': 100,
-            'max_depth': None,
-            'random_state': 42,
-            'threshold': 0.05,  # Threshold for MSE
-            'verbose': 0
-        }
-
-        # Update parameters with kwargs
-        for key, item in kwargs.items():
-            params[key] = item
-        self.params = params
-
-    def create_model(self):
-        """ Creates RF Regressor model using sklearn. """
-        print("(+) Creating Random Forest Regressor model...")
-        self.rf = RandomForestRegressor(
-            n_estimators=self.params['n_estimators'],
-            max_depth=self.params['max_depth'],
-            random_state=self.params['random_state']
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.random_state = random_state
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state
         )
-        return self.rf
+        self.threshold = None
+        self.window = 1
 
-    def train(self, x_train, y_train):
-        """ Train the RF model on labeled data. """
-        self.create_model()
-        print("(+) Training RF model...")
-        self.rf.fit(x_train, y_train)
+    def train(self, X_train):
+        """
+        Train the model to predict the next timestep value of the first sensor.
+        """
+        print("(+) Training Random Forest Regressor...")
+        X = X_train[:-1, :]
+        y = X_train[1:, 0]  # predict next step of sensor 0
+        self.model.fit(X, y)
 
-    def predict(self, x_test):
-        """ Predict numeric output using trained RF model. """
-        return self.rf.predict(x_test)
+    def detect(self, X_test, X_val=None, quantile=0.95, window=1):
+        """
+        Predict anomalies by comparing squared error to dynamic threshold.
+        """
+        if X_val is not None:
+            Xv = X_val[:-1, :]
+            yv = X_val[1:, 0]
+            preds_val = self.model.predict(Xv)
+            val_errors = (preds_val - yv) ** 2
+            self.threshold = np.quantile(val_errors, quantile)
 
-    def detect(self, x_test, y_true):
-        """ Perform anomaly detection by comparing MSE with threshold. """
-        y_pred = self.predict(x_test)
-        mse = (y_pred - y_true) ** 2
-        anomalies = (mse > self.params['threshold']).astype(int)
-        return anomalies, y_pred, mse
+        # Predict test data
+        X = X_test[:-1, :]
+        y_true = X_test[1:, 0]
+        preds = self.model.predict(X)
+        errors = (preds - y_true) ** 2
 
-    def get_rf(self):
-        """ Return the internal Random Forest model. """
-        return self.rf
+        raw_flags = (errors > self.threshold).astype(int)
+        raw_flags = np.concatenate([[0], raw_flags])  # Align with input length
+
+        # Apply sliding window smoothing
+        if window > 1:
+            flags = np.zeros_like(raw_flags)
+            for i in range(len(raw_flags)):
+                start = max(0, i - window + 1)
+                flags[i] = raw_flags[start:i + 1].max()
+        else:
+            flags = raw_flags
+
+        return flags, preds, errors
+
+    def get_model(self):
+        return self.model
+
 
 if __name__ == "__main__":
-    print("Not a main file.")
+    print("Not a standalone script.")
