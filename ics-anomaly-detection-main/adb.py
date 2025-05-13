@@ -1,113 +1,101 @@
 import numpy as np
-import warnings
-warnings.filterwarnings('ignore', category=FutureWarning)
-
 from sklearn.ensemble import AdaBoostRegressor
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import make_scorer, mean_squared_error
-from scipy.ndimage import uniform_filter1d
+from sklearn.metrics import mean_squared_error
+from itertools import product
+from tqdm import tqdm
 
-class ABRegressorDetector(object):
-    """ sklearn-based AdaBoost Regressor for ICS anomaly detection with extended functionality. """
-
-    def __init__(self, **kwargs):
-        print("(+) Initializing AdaBoost Regressor...")
-
-        # Default parameters
-        params = {
-            'n_estimators': 50,
-            'learning_rate': 1.0,
-            'loss': 'linear',
-            'random_state': 42,
-            'threshold': 0.05,  # Threshold for MSE-based anomaly detection
-            'window_size': 1,   # Default no smoothing
-            'percentile': None  # If None, use MSE threshold; else use percentile-based thresholding
-        }
-
-        for key, item in kwargs.items():
-            params[key] = item
-        self.params = params
-
-    def create_model(self):
-        print("(+) Creating AdaBoost Regressor model...")
-        base_estimator = DecisionTreeRegressor(max_depth=4)
+class AdaBoostRegressorDetector:
+    """
+    AdaBoost-based Detector for ICS anomaly detection using one-step-ahead regression.
+    Predicts the next value of the first sensor channel.
+    """
+    def __init__(self, n_estimators=100, learning_rate=0.1, random_state=42):
+        print("(+) Initializing AdaBoost Regressor model...")
         self.model = AdaBoostRegressor(
-            base_estimator=base_estimator,
-            n_estimators=self.params['n_estimators'],
-            learning_rate=self.params['learning_rate'],
-            loss=self.params['loss'],
-            random_state=self.params['random_state']
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            random_state=random_state
         )
-        return self.model
+        self.threshold = None
+        self.window_length = 1
 
-    def train(self, x_train, y_train):
-        self.create_model()
-        print("(+) Training AdaBoost model...")
-        self.model.fit(x_train, y_train)
+    def train(self, X_train):
+        """
+        Train the AdaBoost model to predict the next timestep of the first sensor feature.
+        """
+        print("(+) Training AdaBoost Regressor...")
+        X = X_train[:-1, :]
+        y = X_train[1:, 0]
+        self.model.fit(X, y)
 
-    def predict(self, x_test):
-        return self.model.predict(x_test)
+    def detect(self, X_test, X_val=None, quantile=0.95, window=1):
+        """
+        Detect anomalies in the test set using prediction error thresholding and sliding window.
+        """
+        if X_val is not None:
+            Xv = X_val[:-1, :]
+            yv = X_val[1:, 0]
+            preds = self.model.predict(Xv)
+            errors = (preds - yv) ** 2
+            self.threshold = np.quantile(errors, quantile)
 
-    def detect(self, x_test, y_true):
-        y_pred = self.predict(x_test)
-        mse = (y_pred - y_true) ** 2
+        # Test prediction
+        X = X_test[:-1, :]
+        y_true = X_test[1:, 0]
+        preds = self.model.predict(X)
+        errors = (preds - y_true) ** 2
 
-        # Optional window smoothing
-        if self.params['window_size'] > 1:
-            mse = self.apply_window_smoothing(mse, self.params['window_size'])
+        raw_flags = (errors > self.threshold).astype(int)
+        raw_flags = np.concatenate([[0], raw_flags])  # prepend 0 for alignment
 
-        # Thresholding
-        if self.params['percentile'] is not None:
-            anomalies, threshold = self.threshold_by_percentile(mse, self.params['percentile'])
+        # Apply sliding window
+        if window > 1:
+            flags = np.zeros_like(raw_flags)
+            for i in range(len(raw_flags)):
+                start = max(0, i - window + 1)
+                flags[i] = raw_flags[start:i+1].max()
         else:
-            threshold = self.params['threshold']
-            anomalies = (mse > threshold).astype(int)
+            flags = raw_flags
 
-        print(f"(+) Detection threshold: {threshold:.4f}")
-        return anomalies, y_pred, mse
+        return flags, preds, errors
 
-    def apply_window_smoothing(self, scores, window_size):
-        """ Smooth score sequence to reduce false positives. """
-        return uniform_filter1d(scores, size=window_size)
+    def hyperparameter_tuning(self, X_train, X_val, patience=3):
+        """
+        Grid search for best (n_estimators, learning_rate) using validation MSE.
+        """
+        print("(+) Tuning AdaBoost hyperparameters...")
+        X = X_train[:-1, :]
+        y = X_train[1:, 0]
+        Xv = X_val[:-1, :]
+        yv = X_val[1:, 0]
 
-    def threshold_by_percentile(self, scores, percentile):
-        """ Compute binary predictions using a percentile-based threshold. """
-        threshold = np.percentile(scores, percentile)
-        return (scores >= threshold).astype(int), threshold
+        best_model = None
+        best_mse = float('inf')
+        best_params = {}
+        no_improve_count = 0
 
-    def tune_hyperparameters(self, x_train, y_train):
-        print("(+) Tuning hyperparameters with GridSearchCV...")
+        n_estimators_list = [50, 100, 150, 200]
+        learning_rates = [0.01, 0.05, 0.1, 0.2]
 
-        base_estimator = DecisionTreeRegressor(max_depth=4)
-        model = AdaBoostRegressor(base_estimator=base_estimator, random_state=self.params['random_state'])
+        for n, lr in tqdm(product(n_estimators_list, learning_rates), total=len(n_estimators_list) * len(learning_rates), desc="Hyperparameter tuning"):
+            model = AdaBoostRegressor(n_estimators=n, learning_rate=lr, random_state=42)
+            model.fit(X, y)
+            preds = model.predict(Xv)
+            mse = mean_squared_error(yv, preds)
+            print(f"-> n_estimators={n}, learning_rate={lr}, Val MSE={mse:.5f}")
+            if mse < best_mse:
+                best_mse = mse
+                best_model = model
+                best_params = {'n_estimators': n, 'learning_rate': lr}
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
 
-        param_grid = {
-            'n_estimators': [50, 100, 200],
-            'learning_rate': [0.1, 0.5, 1.0],
-            'loss': ['linear', 'square', 'exponential']
-        }
+            if no_improve_count >= patience:
+                break
 
-        mse_scorer = make_scorer(mean_squared_error, greater_is_better=False)
-
-        grid_search = GridSearchCV(
-            estimator=model,
-            param_grid=param_grid,
-            scoring=mse_scorer,
-            cv=3,
-            verbose=1,
-            n_jobs=-1
-        )
-
-        grid_search.fit(x_train, y_train)
-        print("(+) Best Parameters:", grid_search.best_params_)
-        print("    Best CV MSE:", -grid_search.best_score_)
-
-        self.model = grid_search.best_estimator_
-        return self.model
+        print(f"Best AdaBoost model: n_estimators={best_params['n_estimators']}, learning_rate={best_params['learning_rate']}")
+        self.model = best_model
 
     def get_model(self):
         return self.model
-
-if __name__ == "__main__":
-    print("Not a main file.")
